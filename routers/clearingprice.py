@@ -28,7 +28,8 @@ class Trade(BaseModel):
     buy_no_user_id: str
     yes_order_id: str
     no_order_id: str
-    price: int
+    price_yes: int
+    price_no: int
     quantity: int
     type: str  
 
@@ -124,7 +125,8 @@ def match_order(yes_orders: List[Order], no_orders: List[Order], p: int, max_vol
             buy_no_user_id=n.user_id,
             yes_order_id=y.id,
             no_order_id=n.id,
-            price=p,
+            price_yes=p,
+            price_no=100-p,
             quantity=qty,
             type="cross"
         ))
@@ -142,7 +144,7 @@ def match_order(yes_orders: List[Order], no_orders: List[Order], p: int, max_vol
 # SETTLEMENT ENGINE
 # =========================
 
-def calculate_settlements(trades: List[Trade], yes_map: Dict[str, Order], no_map: Dict[str, Order], p: int) -> List[UserSettlement]:
+def calculate_settlements(trades: List[Trade], yes_map: Dict[str, Order], no_map: Dict[str, Order]) -> List[UserSettlement]:
     settlements = defaultdict(lambda: {"spent" : 0, "refund" : 0})
     for t in trades:
         y_order = yes_map[t.yes_order_id]
@@ -150,14 +152,14 @@ def calculate_settlements(trades: List[Trade], yes_map: Dict[str, Order], no_map
         qty = t.quantity
 
         locked_yes = y_order.price * qty
-        actual_yes = p * qty
+        actual_yes = t.price_yes * qty
         refund_yes = locked_yes - actual_yes
 
         settlements[t.buy_yes_user_id]["spent"] += actual_yes
         settlements[t.buy_yes_user_id]["refund"] += refund_yes
 
         locked_no = n_order.price * qty
-        actual_no = (100 - p) * qty
+        actual_no = t.price_no * qty
         refund_no = locked_no - actual_no
 
         settlements[t.buy_no_user_id]["spent"] += actual_no
@@ -201,7 +203,7 @@ def clear_ato(data: ATORequest):
 
     trades = match_order(yes_valid, no_valid, p, matched_volume)
 
-    settlements = calculate_settlements(trades, yes_map, no_map, p)
+    settlements = calculate_settlements(trades, yes_map, no_map)
 
     return {
         "clearing_price_yes": p,

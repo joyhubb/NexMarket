@@ -16,7 +16,6 @@ SIDE_NO = "no"
 # =========================
 # MODELS
 # =========================
-
 class Order(BaseModel):
     id: str
     user_id: str
@@ -40,14 +39,67 @@ class Trade(BaseModel):
 
 class MatchingRequest(BaseModel):
     option_id: str
+
     orders_buy_yes: List[Order]
     orders_sell_yes: List[Order]
+
     orders_buy_no: List[Order]
     orders_sell_no: List[Order]
 
 class UserUpdate(BaseModel):
     user_id: str
-    spent: int 
-    received: int
-    yes_delta: int
-    no_delta: int
+    spent: int = 0
+    received: int = 0
+    yes_delta: int = 0
+    no_delta: int = 0
+
+# =========================
+# SORT
+# =========================
+def sort_buy(orders: List[Order]):
+    orders.sort(key=lambda o: (-o.price, o.created_at))
+
+def sort_sell(orders: List[Order]):
+    orders.sort(key=lambda o: (o.price, o.created_at))
+
+# =========================
+# CROSS MATCHING
+# =========================
+def match_cross(buy_yes: List[Order], buy_no: List[Order]) -> List[Trade]:
+    trades = []
+
+    sort_buy(buy_yes)
+    no_buckets: Dict[int, List[Order]] = defaultdict(list)
+    for o in buy_no:
+        no_buckets[o.price].append(o)
+    for price in no_buckets:
+        no_buckets[price].sort(key=lambda o: o.created_at)
+    
+    for y in buy_yes:
+        if y.remain == 0:
+            continue
+
+        target_price = 100 - y.price
+        if target_price not in no_buckets:
+            continue
+        no_list = no_buckets [target_price]
+        j = 0
+        while j < len(no_list) and y.remain > 0:
+            n = no_list[j]
+            if n.remain == 0:
+                j += 1
+                continue
+            qty = min(y.remain, n.remain)
+            trades.append(Trade(
+                type=MATCHING_TYPE_CROSS,
+                user_id_a=y.user_id,    # buyer YES
+                user_id_b=n.user_id,    # buyer NO
+                order_id_a=y.id,
+                order_id_b=n.id,
+                outcome=None,
+                price=y.price,
+                quantity=qty     
+            ))
+
+            y.remain -= qty
+            n.remain -= qty
