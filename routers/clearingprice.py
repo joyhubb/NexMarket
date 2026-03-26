@@ -180,15 +180,6 @@ def calculate_settlements(trades: List[Trade], yes_map: Dict[str, Order], no_map
 @router.post("/clear", response_model=ATOResponse)
 def clear_ato(data: Optional[ATORequest] = None):
 
-    if data is None or not data.orders_yes or not data.orders_no:
-        return {
-            "clearing_price_yes": 0,
-            "clearing_price_no": 0,
-            "matched_volume": 0,
-            "trades": [],
-            "settlements": []
-        }
-
     yes_map = {o.id: copy.deepcopy(o) for o in data.orders_yes}
     no_map = {o.id: copy.deepcopy(o) for o in data.orders_no}
     
