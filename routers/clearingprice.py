@@ -29,7 +29,8 @@ class Trade(BaseModel):
     yes_order_id: str
     no_order_id: str
     price: int
-    quantity: int 
+    quantity: int
+    type: str  
 
 class ATORequest(BaseModel):
     option_id: str
@@ -124,7 +125,8 @@ def match_order(yes_orders: List[Order], no_orders: List[Order], p: int, max_vol
             yes_order_id=y.id,
             no_order_id=n.id,
             price=p,
-            quantity=qty
+            quantity=qty,
+            type="cross"
         ))
 
         y.remain -= qty
