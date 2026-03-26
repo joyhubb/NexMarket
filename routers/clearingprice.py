@@ -34,9 +34,9 @@ class Trade(BaseModel):
     type: str  
 
 class ATORequest(BaseModel):
-    option_id: Optional[str] = None
-    orders_yes: Optional[List[Order]] = None
-    orders_no: Optional[List[Order]] = None
+    option_id: str
+    orders_yes: List[Order]
+    orders_no: List[Order]
 
 class ATOResponse(BaseModel):
     clearing_price_yes: Optional[int]
@@ -178,7 +178,7 @@ def calculate_settlements(trades: List[Trade], yes_map: Dict[str, Order], no_map
 # API
 # =========================
 @router.post("/clear", response_model=ATOResponse)
-def clear_ato(data: Optional[ATORequest] = None):
+def clear_ato(data: ATORequest):
 
     yes_map = {o.id: copy.deepcopy(o) for o in data.orders_yes}
     no_map = {o.id: copy.deepcopy(o) for o in data.orders_no}
