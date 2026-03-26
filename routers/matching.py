@@ -98,8 +98,45 @@ def match_cross(buy_yes: List[Order], buy_no: List[Order]) -> List[Trade]:
                 order_id_b=n.id,
                 outcome=None,
                 price=y.price,
-                quantity=qty     
+                quantity=qty
             ))
 
             y.remain -= qty
             n.remain -= qty
+
+            if n.remain == 0:
+                j += 1
+    
+    return trades
+
+# =========================
+# SAME SIDE MATCHING
+# =========================
+def match_same_side(
+    buy_orders: List[Order],
+    sell_orders: List[Order],
+    outcome: str
+) -> List[Trade]:
+    trades = []
+    sort_buy(buy_orders)
+    sort_sell(sell_orders)
+
+    i, j = 0, 0
+    while i < len(buy_orders) and i < len(sell_orders):
+        b = buy_orders[i]
+        s = sell_orders[j]
+
+        if b.price < s.price:
+            break
+        qty = min(b.remain, s.remain)
+
+        trades.append(Trade(
+            type=MATCHING_TYPE_sAME,
+            outcome=outcome,
+            user_id_a=b.user_id,    # buyer
+            user_id_b=s.user_id,    # seller
+            order_id_a=b.id,
+            order_id_b=s.id,
+            price=s.price,
+            quantity=qty
+        ))
