@@ -5,3 +5,4 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 apscheduler
+pydantic>=1.10,<2
