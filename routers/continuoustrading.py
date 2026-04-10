@@ -1,98 +1,125 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-import uvicorn
+from fastapi import APIRouter
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel
 
-from models import (
-    OrderRequest, OrderResponse, MatchResult,
-    OrderBookSnapshot, TradeHistory, CancelOrderRequest
-)
-from engine import MatchingEngine
+from engine import MatchingEngine, Order
+from models import OrderSide, OrderType
 
+router = APIRouter()
 engine = MatchingEngine()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Seed some ATO residual orders for demo
-    engine.seed_ato_residuals()
-    yield
 
-app = FastAPI(
-    title="Continuous Trading Matching Engine",
-    description="Price-Time Priority Matching Engine for Continuous Trading Session",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+# ── Bubble request schema ────────────────────────────────────────────────────
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class ContinuousMatchRequest(BaseModel):
+    incoming_order_id: str
+    incoming_user_id: str
+    market_id: str            # symbol (e.g. "OPT1", "VNM")
+    side: str                 # "BUY" or "SELL"
+    price: float
+    remaining_quantity: int
+    created_at: str           # ISO-8601 e.g. "2026-04-08T10:00:00Z"
 
 
-@app.get("/")
-def root():
-    return {"message": "Continuous Trading Engine is running", "session": "CT"}
+# ── Bubble response schema ───────────────────────────────────────────────────
+
+class MatchedTrade(BaseModel):
+    trade_id: str
+    resting_order_id: str
+    resting_user_id: Optional[str]
+    price: float
+    quantity: int
 
 
-@app.post("/orders", response_model=OrderResponse, summary="Submit a new order")
-def submit_order(req: OrderRequest):
+class ContinuousMatchResponse(BaseModel):
+    incoming_order_id: str
+    market_id: str
+    side: str
+    requested_quantity: int
+    filled_quantity: int
+    remaining_quantity: int
+    status: str               # "NEW" | "PARTIAL" | "FILLED"
+    trades: list[MatchedTrade]
+    message: str
+
+
+# ── Endpoint ─────────────────────────────────────────────────────────────────
+
+@router.post("/continuous-match", response_model=ContinuousMatchResponse)
+def continuous_match(req: ContinuousMatchRequest):
     """
-    Submit a buy or sell order into the continuous trading session.
-    - Orders are matched immediately using price-time priority.
-    - Unmatched (or partially matched) orders rest in the order book.
+    Nhận lệnh từ Bubble và khớp theo ưu tiên giá-thời gian (Price-Time Priority).
+
+    Quy tắc:
+    - Ưu tiên 1 – GIÁ: bid cao nhất / ask thấp nhất được khớp trước.
+    - Ưu tiên 2 – THỜI GIAN: cùng giá → lệnh vào sớm hơn (theo giây) được khớp trước.
+    - Lệnh dư ATO đã có sẵn trong sổ với timestamp cũ → luôn có time priority
+      cao hơn lệnh CT mới vào cùng mức giá.
+    - Phần chưa khớp được giữ lại trong sổ lệnh.
     """
-    result = engine.submit_order(req)
-    return result
+
+    # Parse timestamp từ Bubble (ISO-8601, có thể có "Z" hoặc "+00:00")
+    try:
+        submitted_at = datetime.fromisoformat(req.created_at.replace("Z", "+00:00"))
+    except ValueError:
+        submitted_at = datetime.utcnow()
+
+    side = OrderSide.BUY if req.side.strip().upper() == "BUY" else OrderSide.SELL
+
+    # Tạo Order nội bộ, dùng order_id của Bubble làm key
+    order = Order(
+        symbol=req.market_id,
+        side=side,
+        order_type=OrderType.LIMIT,
+        price=req.price,
+        quantity=req.remaining_quantity,
+        account_id=req.incoming_user_id,
+        submitted_at=submitted_at,
+    )
+    order.order_id = req.incoming_order_id
+    engine._all_orders[order.order_id] = order
+
+    # Chạy matching
+    engine._match(order)
+
+    # Phần còn dư → đưa vào sổ lệnh chờ khớp tiếp
+    if order.remaining > 0:
+        engine._book(order.symbol).add_order(order)
+
+    # Build danh sách trade để trả về Bubble
+    trades = [
+        MatchedTrade(
+            trade_id=f.trade_id,
+            resting_order_id=f.matched_order_id,
+            resting_user_id=_get_account_id(f.matched_order_id),
+            price=f.price,
+            quantity=f.quantity,
+        )
+        for f in order.fills
+    ]
+
+    # Thông điệp mô tả kết quả
+    if order.remaining == 0:
+        msg = "Order fully filled"
+    elif order.filled_quantity > 0:
+        msg = f"Partially filled {order.filled_quantity}/{req.remaining_quantity}, {order.remaining} units resting"
+    else:
+        msg = "No matching order found, resting in order book"
+
+    return ContinuousMatchResponse(
+        incoming_order_id=req.incoming_order_id,
+        market_id=req.market_id,
+        side=req.side.upper(),
+        requested_quantity=req.remaining_quantity,
+        filled_quantity=order.filled_quantity,
+        remaining_quantity=order.remaining,
+        status=order.status.value,
+        trades=trades,
+        message=msg,
+    )
 
 
-@app.delete("/orders/{order_id}", summary="Cancel an order")
-def cancel_order(order_id: str):
-    """Cancel a resting order by its ID."""
-    success = engine.cancel_order(order_id)
-    if not success:
-        raise HTTPException(status_code=404, detail=f"Order {order_id} not found or already filled")
-    return {"message": f"Order {order_id} cancelled successfully"}
-
-
-@app.get("/orderbook/{symbol}", response_model=OrderBookSnapshot, summary="Get order book")
-def get_orderbook(symbol: str, depth: int = 10):
-    """
-    Get the current order book snapshot for a symbol.
-    Returns top N price levels on each side.
-    """
-    return engine.get_orderbook(symbol, depth)
-
-
-@app.get("/trades", response_model=list[TradeHistory], summary="Get trade history")
-def get_trades(symbol: str = None, limit: int = 50):
-    """Get recent matched trades, optionally filtered by symbol."""
-    return engine.get_trades(symbol, limit)
-
-
-@app.get("/orders/{order_id}", summary="Get order status")
-def get_order(order_id: str):
-    """Get the current status of a specific order."""
-    order = engine.get_order(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
-    return order
-
-
-@app.get("/orders", summary="List all active orders")
-def list_orders(symbol: str = None, side: str = None):
-    """List all active (unfilled) orders in the order book."""
-    return engine.list_orders(symbol, side)
-
-
-@app.delete("/orderbook/{symbol}/reset", summary="Reset order book (dev only)")
-def reset_orderbook(symbol: str):
-    """Clear all orders and trades for a symbol."""
-    engine.reset(symbol)
-    return {"message": f"Order book for {symbol} has been reset"}
-
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+def _get_account_id(order_id: str) -> Optional[str]:
+    o = engine._all_orders.get(order_id)
+    return o.account_id if o else None
