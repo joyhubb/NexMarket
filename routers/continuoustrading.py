@@ -113,6 +113,8 @@ def _match(incoming: dict) -> list[dict]:
             "resting_user_id":  resting.get("user_id"),
             "price":            trade_price,
             "quantity":         fill_qty,
+            "resting_filled_quantity":   resting["filled"] + fill_qty,
+            "resting_remaining_quantity": _remaining(resting) - fill_qty,
         })
 
         incoming["filled"] += fill_qty
@@ -146,6 +148,11 @@ class MatchedTrade(BaseModel):
     price:              float
     quantity:           int
 
+class UpdatedOrder(BaseModel):
+    order_id: str
+    filled_quantity: int
+    remaining_quantity: int
+    status: str
 
 class ContinuousMatchResponse(BaseModel):
     order_id:           str
@@ -157,6 +164,7 @@ class ContinuousMatchResponse(BaseModel):
     status:             str           # NEW | PARTIAL | FILLED
     trades:             list[MatchedTrade]
     message:            str
+    updated_orders:     list[UpdatedOrder] = []
 
 
 # ─────────────────────────────────────────────
@@ -213,7 +221,24 @@ def continuous_match(req: ContinuousMatchRequest):
     else:
         status = STATUS_NEW
         msg    = "No matching order found, order resting in book"
+    updated_orders = []
+    
+    for t in trades:
+        if t["resting_remaining_quantity"] == 0:
+            opposing_status = STATUS_FILLED
+        elif t["resting_filled_quantity"] > 0:
+            opposing_status = STATUS_PARTIAL
+        else:
+            opposing_status = STATUS_NEW
 
+        updated_orders.append(
+            UpdatedOrder(
+                order_id=t["resting_order_id"],
+                filled_quantity=t["resting_filled_quantity"],
+                remaining_quantity=t["resting_remaining_quantity"],
+                status=opposing_status,
+            )
+        )
     return ContinuousMatchResponse(
         order_id           = req.order_id,
         option_id          = req.option_id,
@@ -222,6 +247,13 @@ def continuous_match(req: ContinuousMatchRequest):
         filled_quantity    = filled,
         remaining_quantity = remaining,
         status             = status,
-        trades             = [MatchedTrade(**t) for t in trades],
-        message            = msg,
+        trades             = [MatchedTrade(
+            trade_id=t["trade_id"],
+            resting_order_id=t["resting_order_id"],
+            resting_user_id=t["resting_user_id"],
+            price=t["price"],
+            quantity=t["quantity"],
+        ) for t in trades],
+            message            = msg,
+            updated_orders     = updated_orders,
     )
