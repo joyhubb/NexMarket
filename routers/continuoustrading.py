@@ -1,7 +1,7 @@
 from fastapi import APIRouter
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal
+from datetime import datetime, timezone
 from sortedcontainers import SortedList
 import uuid
 
@@ -10,20 +10,54 @@ router = APIRouter()
 # ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
-BUY  = "BUY"
+BUY = "BUY"
 SELL = "SELL"
 
-STATUS_NEW     = "NEW"
+STATUS_NEW = "NEW"
 STATUS_PARTIAL = "PARTIAL"
-STATUS_FILLED  = "FILLED"
+STATUS_FILLED = "FILLED"
+
 
 # ─────────────────────────────────────────────
-# In-memory order book (per option_id)
-# key = option_id (Bubble's Option Slug)
+# In-memory order book
+# key = option_id
+# value = SortedList of tuples: (sort_key, order_id)
 # ─────────────────────────────────────────────
-_bids:   dict = {}   # option_id → SortedList
-_asks:   dict = {}   # option_id → SortedList
-_orders: dict = {}   # order_id  → order_dict
+_bids: dict[str, SortedList] = {}
+_asks: dict[str, SortedList] = {}
+_orders: dict[str, dict] = {}
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_datetime(value: str) -> datetime:
+    """
+    Parse ISO-8601 string from Bubble.
+    Falls back to current UTC time if invalid.
+    """
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return _utc_now()
+
+
+def _normalize_side(value: str) -> str:
+    """
+    Accept BUY / SELL / YES / NO.
+    YES is mapped to BUY, NO is mapped to SELL only for matching side semantics.
+    Adjust this if your Bubble side field is always BUY/SELL.
+    """
+    raw = str(value).strip().upper()
+    if raw in ("BUY", "YES"):
+        return BUY
+    if raw in ("SELL", "NO"):
+        return SELL
+    raise ValueError(f"Invalid side: {value}")
 
 
 def _get_bids(option_id: str) -> SortedList:
@@ -39,28 +73,50 @@ def _get_asks(option_id: str) -> SortedList:
 
 
 def _bid_key(price: float, ts: datetime):
-    """Higher price first → earlier time first."""
+    """
+    Best bid first: higher price first, then earlier time first.
+    """
     return (-price, ts.timestamp())
 
 
 def _ask_key(price: float, ts: datetime):
-    """Lower price first → earlier time first."""
+    """
+    Best ask first: lower price first, then earlier time first.
+    """
     return (price, ts.timestamp())
 
 
-def _add_to_book(order: dict):
+def _remaining(order: dict) -> int:
+    return max(0, int(order["quantity"]) - int(order["filled"]))
+
+
+def _add_to_book(order: dict) -> None:
+    """
+    Add an order to the in-memory order book.
+    Assumes the order still has remaining quantity > 0.
+    """
+    if _remaining(order) <= 0:
+        return
+
     ts = order["submitted_at"]
     oid = order["option_id"]
+
     if order["side"] == BUY:
         _get_bids(oid).add((_bid_key(order["price"], ts), order["order_id"]))
     else:
         _get_asks(oid).add((_ask_key(order["price"], ts), order["order_id"]))
+
     _orders[order["order_id"]] = order
 
 
-def _remove_from_book(order: dict):
+def _remove_from_book(order: dict) -> None:
+    """
+    Remove an order from the in-memory order book.
+    Safe to call even if the tuple is already missing.
+    """
     ts = order["submitted_at"]
     oid = order["option_id"]
+
     try:
         if order["side"] == BUY:
             _get_bids(oid).remove((_bid_key(order["price"], ts), order["order_id"]))
@@ -70,15 +126,54 @@ def _remove_from_book(order: dict):
         pass
 
 
-def _remaining(order: dict) -> int:
-    return order["quantity"] - order["filled"]
+def _build_internal_order(payload: dict) -> dict:
+    """
+    Convert Bubble payload order into internal order format.
+
+    Expected payload fields:
+    - order_id
+    - user_id
+    - option_id
+    - side
+    - price
+    - remain_quantity
+    - created_date
+    """
+    remain_quantity = int(payload["remain_quantity"])
+    if remain_quantity < 0:
+        remain_quantity = 0
+
+    return {
+        "order_id": str(payload["order_id"]),
+        "user_id": str(payload["user_id"]),
+        "option_id": str(payload["option_id"]),
+        "side": _normalize_side(payload["side"]),
+        "price": float(payload["price"]),
+        "quantity": remain_quantity,   # remaining quantity only
+        "filled": 0,                   # reset for this matching run
+        "submitted_at": _parse_datetime(str(payload["created_date"])),
+    }
+
+
+def _reset_books() -> None:
+    _bids.clear()
+    _asks.clear()
+    _orders.clear()
 
 
 def _match(incoming: dict) -> list[dict]:
     """
-    Khớp lệnh theo ưu tiên Giá → Thời gian (Price-Time Priority).
-    - BUY:  khớp với ask thấp nhất; nếu cùng giá → ask vào sớm nhất
-    - SELL: khớp với bid cao nhất; nếu cùng giá → bid vào sớm nhất
+    Match according to Price-Time Priority.
+
+    BUY incoming:
+      - matches lowest ask first
+      - if same price, earlier resting order first
+
+    SELL incoming:
+      - matches highest bid first
+      - if same price, earlier resting order first
+
+    Trade price = resting order price
     """
     trades = []
     option_id = incoming["option_id"]
@@ -88,172 +183,207 @@ def _match(incoming: dict) -> list[dict]:
             book_side = _get_asks(option_id)
             if not book_side:
                 break
+
             _, resting_id = book_side[0]
             resting = _orders[resting_id]
-            # BUY chỉ khớp nếu bid >= ask
+
+            # BUY can match only if incoming bid >= resting ask
             if incoming["price"] < resting["price"]:
                 break
+
         else:
             book_side = _get_bids(option_id)
             if not book_side:
                 break
+
             _, resting_id = book_side[0]
             resting = _orders[resting_id]
-            # SELL chỉ khớp nếu ask <= bid
+
+            # SELL can match only if incoming ask <= resting bid
             if incoming["price"] > resting["price"]:
                 break
 
-        fill_qty    = min(_remaining(incoming), _remaining(resting))
-        trade_price = resting["price"]   # giá lệnh chờ là giá khớp
-        trade_id    = "T-" + str(uuid.uuid4())[:8].upper()
-
-        trades.append({
-            "trade_id":         trade_id,
-            "resting_order_id": resting["order_id"],
-            "resting_user_id":  resting.get("user_id"),
-            "price":            trade_price,
-            "quantity":         fill_qty,
-            "resting_filled_quantity":   resting["filled"] + fill_qty,
-            "resting_remaining_quantity": _remaining(resting) - fill_qty,
-        })
+        fill_qty = min(_remaining(incoming), _remaining(resting))
+        trade_price = resting["price"]
+        trade_id = "T-" + str(uuid.uuid4())[:8].upper()
 
         incoming["filled"] += fill_qty
-        resting["filled"]  += fill_qty
+        resting["filled"] += fill_qty
 
-        if _remaining(resting) == 0:
+        resting_remaining = _remaining(resting)
+        incoming_remaining = _remaining(incoming)
+
+        trades.append({
+            "trade_id": trade_id,
+            "resting_order_id": resting["order_id"],
+            "resting_user_id": resting.get("user_id"),
+            "incoming_order_id": incoming["order_id"],
+            "incoming_user_id": incoming.get("user_id"),
+            "option_id": option_id,
+            "price": trade_price,
+            "quantity": fill_qty,
+            "resting_filled_quantity": int(resting["filled"]),
+            "resting_remaining_quantity": int(resting_remaining),
+            "incoming_filled_quantity": int(incoming["filled"]),
+            "incoming_remaining_quantity": int(incoming_remaining),
+        })
+
+        if resting_remaining == 0:
             _remove_from_book(resting)
 
     return trades
 
 
 # ─────────────────────────────────────────────
-# Schemas  –  khớp đúng với Bubble data types
+# Schemas
 # ─────────────────────────────────────────────
+class BubbleOrderPayload(BaseModel):
+    order_id: str
+    user_id: str
+    option_id: str
+    side: str
+    price: float
+    remain_quantity: int = Field(ge=0)
+    created_date: str
+
 
 class ContinuousMatchRequest(BaseModel):
-    # Từ Order record trong Bubble
-    order_id:           str           # Unique ID của Order (Bubble slug)
-    user_id:            str           # User đặt lệnh
-    option_id:          str           # Option slug (thay cho market_id)
-    side:               str           # "BUY" hoặc "SELL"
-    price:              float         # Order.price
-    remain_quantity:    int           # Order.remain quantity
-    created_date:       str           # Order.Created Date (ISO-8601)
+    incoming_order: BubbleOrderPayload
+    order_book: List[BubbleOrderPayload] = []
 
 
 class MatchedTrade(BaseModel):
-    trade_id:           str
-    resting_order_id:   str
-    resting_user_id:    Optional[str]
-    price:              float
-    quantity:           int
+    trade_id: str
+    resting_order_id: str
+    resting_user_id: Optional[str] = None
+    price: float
+    quantity: int
+
 
 class UpdatedOrder(BaseModel):
     order_id: str
     filled_quantity: int
     remaining_quantity: int
-    status: str
+    status: Literal["NEW", "PARTIAL", "FILLED"]
+
 
 class ContinuousMatchResponse(BaseModel):
-    order_id:           str
-    option_id:          str
-    side:               str
+    order_id: str
+    option_id: str
+    side: str
     requested_quantity: int
-    filled_quantity:    int
+    filled_quantity: int
     remaining_quantity: int
-    status:             str           # NEW | PARTIAL | FILLED
-    trades:             list[MatchedTrade]
-    message:            str
-    updated_orders:     list[UpdatedOrder] = []
+    status: Literal["NEW", "PARTIAL", "FILLED"]
+    trades: List[MatchedTrade]
+    message: str
+    updated_orders: List[UpdatedOrder] = []
 
 
 # ─────────────────────────────────────────────
 # Endpoint
 # ─────────────────────────────────────────────
-
 @router.post("/continuous-match", response_model=ContinuousMatchResponse)
 def continuous_match(req: ContinuousMatchRequest):
     """
-    Khớp lệnh liên tục (CT) sau phiên ATO.
-    Ưu tiên: Giá tốt hơn trước → cùng giá thì lệnh vào sớm hơn (theo giây) trước.
-    Lệnh dư ATO đã có sẵn trong sổ với timestamp cũ → tự động ưu tiên hơn lệnh CT mới.
+    Continuous matching after ATO.
+
+    Bubble sends:
+    - incoming_order: the newly placed order
+    - order_book: all current resting orders for the same option
+                  (typically leftover orders from ATO + earlier CT resting orders)
+
+    This endpoint:
+    1. resets in-memory state
+    2. loads resting orders into the book
+    3. matches the incoming order against the book
+    4. returns incoming order result + updated resting orders
     """
-    # Parse timestamp từ Bubble (ISO-8601)
-    try:
-        submitted_at = datetime.fromisoformat(req.created_date.replace("Z", "+00:00"))
-    except ValueError:
-        submitted_at = datetime.utcnow()
+    _reset_books()
 
-    # Normalize side: Bubble Option Set thường là "BUY"/"SELL" hoặc "yes"/"no"
-    # Dựa vào Option set "Side Order" – cần confirm, tạm thời handle cả hai
-    raw_side = req.side.strip().upper()
-    if raw_side in ("BUY", "YES"):
-        side = BUY
-    else:
-        side = SELL
+    # 1) Load resting orders into book
+    incoming_order_id = req.incoming_order.order_id
+    incoming_option_id = req.incoming_order.option_id
 
-    order = {
-        "order_id":     req.order_id,
-        "user_id":      req.user_id,
-        "option_id":    req.option_id,
-        "side":         side,
-        "price":        req.price,
-        "quantity":     req.remain_quantity,
-        "filled":       0,
-        "submitted_at": submitted_at,
-    }
-    _orders[order["order_id"]] = order
+    for o in req.order_book:
+        # Skip the incoming order itself if Bubble accidentally includes it
+        if o.order_id == incoming_order_id:
+            continue
 
-    trades = _match(order)
+        # Only load same option_id into this matching run
+        if o.option_id != incoming_option_id:
+            continue
 
-    if _remaining(order) > 0:
-        _add_to_book(order)
+        internal_order = _build_internal_order(o.model_dump())
 
-    filled    = order["filled"]
-    remaining = _remaining(order)
+        if internal_order["quantity"] > 0:
+            _add_to_book(internal_order)
+
+    # 2) Build incoming order
+    incoming = _build_internal_order(req.incoming_order.model_dump())
+    _orders[incoming["order_id"]] = incoming
+
+    # 3) Match
+    trades = _match(incoming)
+
+    # 4) If still remaining, keep it resting in book
+    if _remaining(incoming) > 0:
+        _add_to_book(incoming)
+
+    filled = int(incoming["filled"])
+    remaining = int(_remaining(incoming))
+    requested = int(incoming["quantity"])
 
     if remaining == 0:
         status = STATUS_FILLED
-        msg    = "Order fully filled"
+        message = "Order fully filled"
     elif filled > 0:
         status = STATUS_PARTIAL
-        msg    = f"Partially filled {filled}/{req.remain_quantity}, {remaining} units resting in book"
+        message = f"Partially filled {filled}/{requested}, {remaining} units resting in book"
     else:
         status = STATUS_NEW
-        msg    = "No matching order found, order resting in book"
-    updated_orders = []
-    
+        message = "No matching order found, order resting in book"
+
+    updated_orders: list[UpdatedOrder] = []
+
     for t in trades:
-        if t["resting_remaining_quantity"] == 0:
-            opposing_status = STATUS_FILLED
-        elif t["resting_filled_quantity"] > 0:
-            opposing_status = STATUS_PARTIAL
+        resting_filled = int(t["resting_filled_quantity"])
+        resting_remaining = int(t["resting_remaining_quantity"])
+
+        if resting_remaining == 0:
+            resting_status = STATUS_FILLED
+        elif resting_filled > 0:
+            resting_status = STATUS_PARTIAL
         else:
-            opposing_status = STATUS_NEW
+            resting_status = STATUS_NEW
 
         updated_orders.append(
             UpdatedOrder(
                 order_id=t["resting_order_id"],
-                filled_quantity=t["resting_filled_quantity"],
-                remaining_quantity=t["resting_remaining_quantity"],
-                status=opposing_status,
+                filled_quantity=resting_filled,
+                remaining_quantity=resting_remaining,
+                status=resting_status,
             )
         )
+
     return ContinuousMatchResponse(
-        order_id           = req.order_id,
-        option_id          = req.option_id,
-        side               = side,
-        requested_quantity = req.remain_quantity,
-        filled_quantity    = filled,
-        remaining_quantity = remaining,
-        status             = status,
-        trades             = [MatchedTrade(
-            trade_id=t["trade_id"],
-            resting_order_id=t["resting_order_id"],
-            resting_user_id=t["resting_user_id"],
-            price=t["price"],
-            quantity=t["quantity"],
-        ) for t in trades],
-            message            = msg,
-            updated_orders     = updated_orders,
+        order_id=incoming["order_id"],
+        option_id=incoming["option_id"],
+        side=incoming["side"],
+        requested_quantity=requested,
+        filled_quantity=filled,
+        remaining_quantity=remaining,
+        status=status,
+        trades=[
+            MatchedTrade(
+                trade_id=t["trade_id"],
+                resting_order_id=t["resting_order_id"],
+                resting_user_id=t["resting_user_id"],
+                price=t["price"],
+                quantity=t["quantity"],
+            )
+            for t in trades
+        ],
+        message=message,
+        updated_orders=updated_orders,
     )
