@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, List, Literal
 from datetime import datetime, timezone
 from sortedcontainers import SortedList
@@ -17,11 +17,9 @@ STATUS_NEW = "NEW"
 STATUS_PARTIAL = "PARTIAL"
 STATUS_FILLED = "FILLED"
 
-
 # ─────────────────────────────────────────────
-# In-memory order book
+# In-memory order book (per option_id)
 # key = option_id
-# value = SortedList of tuples: (sort_key, order_id)
 # ─────────────────────────────────────────────
 _bids: dict[str, SortedList] = {}
 _asks: dict[str, SortedList] = {}
@@ -36,10 +34,6 @@ def _utc_now() -> datetime:
 
 
 def _parse_datetime(value: str) -> datetime:
-    """
-    Parse ISO-8601 string from Bubble.
-    Falls back to current UTC time if invalid.
-    """
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
@@ -47,11 +41,6 @@ def _parse_datetime(value: str) -> datetime:
 
 
 def _normalize_side(value: str) -> str:
-    """
-    Accept BUY / SELL / YES / NO.
-    YES is mapped to BUY, NO is mapped to SELL only for matching side semantics.
-    Adjust this if your Bubble side field is always BUY/SELL.
-    """
     raw = str(value).strip().upper()
     if raw in ("BUY", "YES"):
         return BUY
@@ -73,16 +62,12 @@ def _get_asks(option_id: str) -> SortedList:
 
 
 def _bid_key(price: float, ts: datetime):
-    """
-    Best bid first: higher price first, then earlier time first.
-    """
+    # higher price first, earlier time first
     return (-price, ts.timestamp())
 
 
 def _ask_key(price: float, ts: datetime):
-    """
-    Best ask first: lower price first, then earlier time first.
-    """
+    # lower price first, earlier time first
     return (price, ts.timestamp())
 
 
@@ -91,10 +76,6 @@ def _remaining(order: dict) -> int:
 
 
 def _add_to_book(order: dict) -> None:
-    """
-    Add an order to the in-memory order book.
-    Assumes the order still has remaining quantity > 0.
-    """
     if _remaining(order) <= 0:
         return
 
@@ -110,10 +91,6 @@ def _add_to_book(order: dict) -> None:
 
 
 def _remove_from_book(order: dict) -> None:
-    """
-    Remove an order from the in-memory order book.
-    Safe to call even if the tuple is already missing.
-    """
     ts = order["submitted_at"]
     oid = order["option_id"]
 
@@ -126,54 +103,23 @@ def _remove_from_book(order: dict) -> None:
         pass
 
 
-def _build_internal_order(payload: dict) -> dict:
-    """
-    Convert Bubble payload order into internal order format.
+def _get_order_status(order: dict) -> str:
+    remaining = _remaining(order)
+    filled = int(order["filled"])
 
-    Expected payload fields:
-    - order_id
-    - user_id
-    - option_id
-    - side
-    - price
-    - remain_quantity
-    - created_date
-    """
-    remain_quantity = int(payload["remain_quantity"])
-    if remain_quantity < 0:
-        remain_quantity = 0
-
-    return {
-        "order_id": str(payload["order_id"]),
-        "user_id": str(payload["user_id"]),
-        "option_id": str(payload["option_id"]),
-        "side": _normalize_side(payload["side"]),
-        "price": float(payload["price"]),
-        "quantity": remain_quantity,   # remaining quantity only
-        "filled": 0,                   # reset for this matching run
-        "submitted_at": _parse_datetime(str(payload["created_date"])),
-    }
-
-
-def _reset_books() -> None:
-    _bids.clear()
-    _asks.clear()
-    _orders.clear()
+    if remaining == 0:
+        return STATUS_FILLED
+    if filled > 0:
+        return STATUS_PARTIAL
+    return STATUS_NEW
 
 
 def _match(incoming: dict) -> list[dict]:
     """
-    Match according to Price-Time Priority.
-
-    BUY incoming:
-      - matches lowest ask first
-      - if same price, earlier resting order first
-
-    SELL incoming:
-      - matches highest bid first
-      - if same price, earlier resting order first
-
-    Trade price = resting order price
+    Price-Time Priority:
+    - BUY matches best ask first
+    - SELL matches best bid first
+    - Trade price = resting order price
     """
     trades = []
     option_id = incoming["option_id"]
@@ -187,7 +133,7 @@ def _match(incoming: dict) -> list[dict]:
             _, resting_id = book_side[0]
             resting = _orders[resting_id]
 
-            # BUY can match only if incoming bid >= resting ask
+            # bid must be >= ask
             if incoming["price"] < resting["price"]:
                 break
 
@@ -199,7 +145,7 @@ def _match(incoming: dict) -> list[dict]:
             _, resting_id = book_side[0]
             resting = _orders[resting_id]
 
-            # SELL can match only if incoming ask <= resting bid
+            # ask must be <= bid
             if incoming["price"] > resting["price"]:
                 break
 
@@ -210,25 +156,17 @@ def _match(incoming: dict) -> list[dict]:
         incoming["filled"] += fill_qty
         resting["filled"] += fill_qty
 
-        resting_remaining = _remaining(resting)
-        incoming_remaining = _remaining(incoming)
-
         trades.append({
             "trade_id": trade_id,
             "resting_order_id": resting["order_id"],
             "resting_user_id": resting.get("user_id"),
-            "incoming_order_id": incoming["order_id"],
-            "incoming_user_id": incoming.get("user_id"),
-            "option_id": option_id,
             "price": trade_price,
             "quantity": fill_qty,
             "resting_filled_quantity": int(resting["filled"]),
-            "resting_remaining_quantity": int(resting_remaining),
-            "incoming_filled_quantity": int(incoming["filled"]),
-            "incoming_remaining_quantity": int(incoming_remaining),
+            "resting_remaining_quantity": int(_remaining(resting)),
         })
 
-        if resting_remaining == 0:
+        if _remaining(resting) == 0:
             _remove_from_book(resting)
 
     return trades
@@ -237,19 +175,14 @@ def _match(incoming: dict) -> list[dict]:
 # ─────────────────────────────────────────────
 # Schemas
 # ─────────────────────────────────────────────
-class BubbleOrderPayload(BaseModel):
+class ContinuousMatchRequest(BaseModel):
     order_id: str
     user_id: str
     option_id: str
     side: str
     price: float
-    remain_quantity: int = Field(ge=0)
+    remain_quantity: int
     created_date: str
-
-
-class ContinuousMatchRequest(BaseModel):
-    incoming_order: BubbleOrderPayload
-    order_book: List[BubbleOrderPayload] = []
 
 
 class MatchedTrade(BaseModel):
@@ -270,7 +203,7 @@ class UpdatedOrder(BaseModel):
 class ContinuousMatchResponse(BaseModel):
     order_id: str
     option_id: str
-    side: str
+    side: Literal["BUY", "SELL"]
     requested_quantity: int
     filled_quantity: int
     remaining_quantity: int
@@ -286,73 +219,51 @@ class ContinuousMatchResponse(BaseModel):
 @router.post("/continuous-match", response_model=ContinuousMatchResponse)
 def continuous_match(req: ContinuousMatchRequest):
     """
-    Continuous matching after ATO.
+    Continuous matching using in-memory order book.
 
-    Bubble sends:
-    - incoming_order: the newly placed order
-    - order_book: all current resting orders for the same option
-                  (typically leftover orders from ATO + earlier CT resting orders)
-
-    This endpoint:
-    1. resets in-memory state
-    2. loads resting orders into the book
-    3. matches the incoming order against the book
-    4. returns incoming order result + updated resting orders
+    IMPORTANT:
+    - API only receives ONE incoming order each call.
+    - Resting orders must already exist in this API's in-memory book
+      from previous calls.
+    - If the server restarts, the in-memory book is lost.
     """
-    _reset_books()
+    incoming = {
+        "order_id": str(req.order_id),
+        "user_id": str(req.user_id),
+        "option_id": str(req.option_id),
+        "side": _normalize_side(req.side),
+        "price": float(req.price),
+        "quantity": int(req.remain_quantity),
+        "filled": 0,
+        "submitted_at": _parse_datetime(req.created_date),
+    }
 
-    # 1) Load resting orders into book
-    incoming_order_id = req.incoming_order.order_id
-    incoming_option_id = req.incoming_order.option_id
-
-    for o in req.order_book:
-        # Skip the incoming order itself if Bubble accidentally includes it
-        if o.order_id == incoming_order_id:
-            continue
-
-        # Only load same option_id into this matching run
-        if o.option_id != incoming_option_id:
-            continue
-
-        internal_order = _build_internal_order(o.model_dump())
-
-        if internal_order["quantity"] > 0:
-            _add_to_book(internal_order)
-
-    # 2) Build incoming order
-    incoming = _build_internal_order(req.incoming_order.model_dump())
+    # Save incoming order into registry before matching
     _orders[incoming["order_id"]] = incoming
 
-    # 3) Match
     trades = _match(incoming)
 
-    # 4) If still remaining, keep it resting in book
+    # If not fully filled, keep remaining quantity in book
     if _remaining(incoming) > 0:
         _add_to_book(incoming)
 
     filled = int(incoming["filled"])
     remaining = int(_remaining(incoming))
     requested = int(incoming["quantity"])
+    status = _get_order_status(incoming)
 
-    if remaining == 0:
-        status = STATUS_FILLED
+    if status == STATUS_FILLED:
         message = "Order fully filled"
-    elif filled > 0:
-        status = STATUS_PARTIAL
+    elif status == STATUS_PARTIAL:
         message = f"Partially filled {filled}/{requested}, {remaining} units resting in book"
     else:
-        status = STATUS_NEW
         message = "No matching order found, order resting in book"
 
     updated_orders: list[UpdatedOrder] = []
-
     for t in trades:
-        resting_filled = int(t["resting_filled_quantity"])
-        resting_remaining = int(t["resting_remaining_quantity"])
-
-        if resting_remaining == 0:
+        if t["resting_remaining_quantity"] == 0:
             resting_status = STATUS_FILLED
-        elif resting_filled > 0:
+        elif t["resting_filled_quantity"] > 0:
             resting_status = STATUS_PARTIAL
         else:
             resting_status = STATUS_NEW
@@ -360,8 +271,8 @@ def continuous_match(req: ContinuousMatchRequest):
         updated_orders.append(
             UpdatedOrder(
                 order_id=t["resting_order_id"],
-                filled_quantity=resting_filled,
-                remaining_quantity=resting_remaining,
+                filled_quantity=t["resting_filled_quantity"],
+                remaining_quantity=t["resting_remaining_quantity"],
                 status=resting_status,
             )
         )
