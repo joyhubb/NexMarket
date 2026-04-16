@@ -65,8 +65,7 @@ class BubbleOrderPayload(BaseModel):
     created_date: str
 
 
-class ContinuousMatchRequest(BaseModel):
-    incoming_order: BubbleOrderPayload
+class ContinuousMatchRequest(BubbleOrderPayload):
     order_book: List[BubbleOrderPayload] = []
 
 
@@ -113,7 +112,7 @@ def _build_internal_order(payload: BubbleOrderPayload) -> dict:
 
 @router.post("/continuous-match", response_model=ContinuousMatchResponse)
 def continuous_match(req: ContinuousMatchRequest):
-    incoming = _build_internal_order(req.incoming_order)
+    incoming = _build_internal_order(req)
     option_id = incoming["option_id"]
 
     bids: SortedList = SortedList(key=lambda x: x[0])
